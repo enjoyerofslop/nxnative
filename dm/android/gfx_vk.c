@@ -919,7 +919,38 @@ static void post(post_op o) {   // done when the current chunk completes, after 
     if (C->npost == C->cappost) { C->cappost = C->cappost ? 2 * C->cappost : 64; C->post = realloc(C->post, C->cappost * sizeof *C->post); }
     C->post[C->npost++] = o;
 }
-void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); }
+// ---------- Conditional rendering (profile render_cond; nvn_mtl.m OP_RENDER_COND, which this follows) ----------
+// SetRenderEnableConditional(mode, rec) enables rendering if the 64-bit counter of the report at rec equals (RENDER_IF_EQUAL) or differs from (RENDER_IF_NOT_EQUAL) the one at
+// rec + 16, until the next SetRenderEnable(true). Tears of the Kingdom and Animal Crossing: New Horizons wrap their clears this way: rec is set to 1 from the CPU when the target
+// needs a clear, each clear is followed by ReportCounter(TIMESTAMP_TOP, rec), and rec + 16 is never written. A timestamp report puts 0 in the counter field (post_apply), so
+// after one clear the two compare equal and later conditional clears of that target are skipped. Ignored, every clear ran: Animal Crossing's four clear-only passes wiped its
+// composite before the window copy, and every frame was black on an Ayn Odin 2.
+// Evaluated here at replay, on the CPU, from the records in memory, as on Metal (Vulkan's VK_EXT_conditional_rendering reads a 32-bit value, not two 64-bit counters). A report
+// replayed earlier in this submission is not written yet (the completion thread does it): a timestamp one counts with its known counter 0; a samples-passed result is unknown,
+// and a condition on it keeps drawing (occlusion culling only saves work). Inside a block evaluated false, draws and clears are dropped
+static int g_rc_skip;   // a render-enable block evaluated false is active
+static uint64_t g_rc_skipped;   // clears and draws dropped by it (the first is logged)
+#define RC_PEND 256
+static struct { uint64_t addr; int kind; } g_rc_pend[RC_PEND]; static int g_rc_npend;   // reports replayed in this submission: kind 1 = timestamp (counter 0), 2 = another counter (unknown)
+static uint64_t g_rc_occ[4096];   // addresses ever written by a non-timestamp report (open addressing): conditions on them keep drawing
+static void rc_occ_add(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return; if (!g_rc_occ[i]) { g_rc_occ[i] = a; return; } } }
+static int rc_occ_has(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return 1; if (!g_rc_occ[i]) return 0; } return 0; }
+static void rc_note(uint64_t a, int kind) {
+    if (kind == 2) rc_occ_add(a);
+    for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr == a) { g_rc_pend[i].kind = kind; return; }
+    if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend++].kind = kind; }
+}
+static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay
+    if (rc_occ_has(a)) return 0;
+    for (int i = g_rc_npend - 1; i >= 0; i--) if (g_rc_pend[i].addr == a) { if (g_rc_pend[i].kind != 1) return 0; *v = 0; return 1; }
+    *v = *(const volatile uint64_t *)a; return 1;
+}
+static int rc_skips(void) {   // the clear or draw at hand is dropped
+    if (!g_rc_skip) return 0;
+    if (!g_rc_skipped++) LOG("[vk] conditional rendering (render_cond): a clear or draw in a block evaluated false is dropped, as the GPU would");
+    return 1;
+}
+void mtl_sub_begin(void) { pthread_mutex_lock(&g_bk); g_rc_npend = 0; g_rc_skip = 0; }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 // Buffer copies and fills: done on the CPU (GPU address = CPU address). A large one goes to the completion thread, in its place in the queue, so the submitting
@@ -958,7 +989,7 @@ void mtl_exec(const uint8_t *p) {
         // loading and storing its targets (on a tiler GPU the whole frame's bandwidth again and again)
         int cpu_op = h.op == OP_UPDATE_UB || h.op == OP_SIGNAL_EVENT || h.op == OP_REPORT_COUNTER || h.op == OP_FENCE_SYNC || h.op == OP_COPY_STRIDE || h.op == OP_CALL
                      || h.op == OP_CLEAR_BUF || h.op == OP_COPY_B2B
-                     || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS || h.op == OP_RESET_COUNTER;   // clears of the bound targets are made in their pass when they can be (clear_color); the others end it themselves (cb())
+                     || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS || h.op == OP_RESET_COUNTER || h.op == OP_RENDER_COND;   // clears of the bound targets are made in their pass when they can be (clear_color); the others end it themselves (cb())
         if (P.active && h.op != OP_DRAW && h.op != OP_DRAW_IDX && h.op != OP_SCISSOR && h.op != OP_JUMP && h.op != OP_END && !cpu_op && !draw_state_is(h.op)) rp_end();
         switch (h.op) {
             case OP_END: return;
@@ -966,6 +997,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)t); break; }
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8);
+                if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { occl_end(); g_q_reports++; post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, g_q_on ? g_q_win : g_qslot, g_qslot}); }
                 else if (C && C->tq && C->ntq < 256 && (t == 0 || t == 0x10)) {   // a timestamp: written by the GPU at this point of the commands, so two of them time the GPU work between
                     // (Super Mario Bros. Wonder times its frame's GPU work for its dynamic resolution; the host used to write every report of a chunk with one time, its completion)
@@ -973,6 +1005,10 @@ void mtl_exec(const uint8_t *p) {
                     g_ts_reports++; int q = C->ntq++; vkCmdWriteTimestamp(cbuf, t == 0x10 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->tq, (uint32_t)q);
                     post((post_op){4, NULL, 0, 0, ad, (uint32_t)t, (uint64_t)q, 0}); }
                 else mtl_sub_counter(ad, (uint32_t)t);
+                break; }
+            case OP_RENDER_COND: { const p_render_cond *rc = (const p_render_cond *)a;   // recorded only with the profile key render_cond (hle_nvn.c)
+                if (rc->mode >= 2) g_rc_skip = rc->mode == 3;
+                else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y); g_rc_skip = known && (rc->mode ? x == y : x != y); }
                 break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { occl_end(); g_q_on = 1; g_q_win = g_qslot; } break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = atomic_load(&g_fence) + 1; s->fenced = 1; break; }
@@ -989,12 +1025,14 @@ void mtl_exec(const uint8_t *p) {
                 if (C && C->ndraw >= EARLY_DRAWS && !vk_safe()) flush();
                 R.rt = *(const p_set_rt *)a; R.has_rt = 1; break;
             case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
-            case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
-            case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;
+            case OP_CLEAR_COLOR: if (!rc_skips()) clear_color((const p_clear_color *)a); break;
+            case OP_CLEAR_DS: if (!rc_skips()) clear_ds((const p_clear_ds *)a); break;
             case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
-            case OP_DRAW: if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
+            case OP_DRAW: if (rc_skips()) break;
+                if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw t; if (!vk_draw(draw_rec(a, h.size, &t), NULL)) g_draws_dropped++; break; }   // short records: draw_rec (nvn_obj.h)
-            case OP_DRAW_IDX: if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
+            case OP_DRAW_IDX: if (rc_skips()) break;
+                if (C && C->ndraw >= g_mid_draws && !vk_safe()) flush();
                 { p_draw_idx t; if (!vk_draw(NULL, draw_idx_rec(a, h.size, &t))) g_draws_dropped++; break; }
             case OP_DISPATCH: if (!vk_dispatch((const p_dispatch *)a)) g_draws_dropped++; break;
             default: draw_state_op(h.op, a); break;   // state for draws (programs, bindings, render state)
@@ -1005,8 +1043,10 @@ void mtl_exec(const uint8_t *p) {
 }
 static void post_apply(const post_op *o) {   // the completion thread, when the GPU has done the commands before it
     if (o->kind == 1) { if (o->mode == 1) __atomic_fetch_add(o->val, o->v, __ATOMIC_SEQ_CST); else __atomic_store_n(o->val, o->v, __ATOMIC_SEQ_CST); return; }
-    uint64_t now = gpu_ticks(), rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 0 : (o->type == 0 || o->type == 0x10) ? now : 0, now};
-    if (o->kind == 4) { rec[0] = o->type == 0 || o->type == 0x10 ? o->q1 : 0; rec[1] = o->q1; }   // a timestamp the GPU wrote where the report was (gfx_vk.c OP_REPORT_COUNTER)
+    // render_cond: a timestamp report's counter field is 0, as on the GPU, which the conditions after it compare (rc_value); without the key it holds the time, as before
+    int ts = (o->type == 0 || o->type == 0x10) && !DM_GAME_RENDER_COND;
+    uint64_t now = gpu_ticks(), rec[2] = {o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 0 : ts ? now : 0, now};
+    if (o->kind == 4) { rec[0] = ts ? o->q1 : 0; rec[1] = o->q1; }   // a timestamp the GPU wrote where the report was (gfx_vk.c OP_REPORT_COUNTER)
     if (o->kind == 3) { uint64_t sum = 0, a = o->q1 - o->q0 > QRES ? o->q1 - QRES : o->q0; for (uint64_t q = a; q < o->q1; q++) sum += g_qres[q % QRES]; rec[0] = sum; }
     dm_guest_write_prepare((void *)(uintptr_t)o->addr, sizeof rec); memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
 }
