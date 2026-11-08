@@ -4,6 +4,7 @@
 #   python scripts/build_android_from_nsp.py --apk-only [--serial ...]                                  the app with every game host built on this computer, installed
 #   python scripts/build_android_from_nsp.py --migrate --title <title ID> [--serial ...]               a one-game install's folder (files/game) into files/games/<title ID>
 #   python scripts/build_android_from_nsp.py --check | --info <NSP folder>                              requirements / the game's details, as JSON (the desktop app)
+#   python scripts/build_android_from_nsp.py <NSP folder> -k <prod.keys> --game-apk [--xapk] [--out <folder>]   the game in an app of its own, to install anywhere (make_game_app)
 #   --progress json: newline-delimited JSON events on stdout (build_ipa_from_nsp.py Progress), for the desktop app (scripts/nxnative_android.py)
 #   Every build also writes those events to a journal, <data>/builds/<time>-<pid>.jsonl (start and exit events around them), whatever its --progress: the desktop app
 #   shows a build started from a console too
@@ -107,6 +108,12 @@ def build_host(sdk, game_id, work, logs, env):   # → (the game's host, the loa
     ndk = newest(sdk / 'ndk', 'NDK'); cm = newest(sdk / 'cmake', 'CMake') / 'bin'
     exe = '.exe' if os.name == 'nt' else ''
     bdir = work / 'android_host'
+    # a build folder set up from another checkout (a worktree, a clone that moved, another checkout picked in a desktop app): cmake refuses a cache made for another
+    # source folder, so that one starts afresh
+    cache = bdir / 'CMakeCache.txt'
+    if cache.is_file():
+        m = re.search(r'^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$', cache.read_text(encoding='utf-8', errors='replace'), re.M)
+        if m and Path(m.group(1).strip()).resolve() != (REPO / 'dm/android').resolve(): shutil.rmtree(bdir)
     bi.run([cm / f'cmake{exe}', '-G', 'Ninja', '-S', REPO / 'dm/android', '-B', bdir, f'-DCMAKE_MAKE_PROGRAM={cm / ("ninja" + exe)}',
             f'-DCMAKE_TOOLCHAIN_FILE={ndk / "build/cmake/android.toolchain.cmake"}', '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
             f'-DGAME={game_id}', f'-DPython3_EXECUTABLE={sys.executable}'], logs / 'android_cmake.log', env=env)
@@ -168,6 +175,77 @@ def library():   # {title ID: (host, meta)} of the hosts built on this computer
             except (OSError, ValueError): meta = {}
             out[d.name] = (so, meta)
     return out
+
+
+def safe_name(name):   # a file name every file system takes, a phone's and Windows' too
+    return re.sub(r'\s+', ' ', re.sub(r'[/\\:*?"<>|]', '', name)).strip()
+
+
+def clone(src, dst):   # an APFS clone where the volume can make one, else a hard link, else a copy: the RomFS beside a game app costs no space where it can
+    Path(dst).unlink(missing_ok=True)
+    if sys.platform == 'darwin' and subprocess.run(['cp', '-c', str(src), str(dst)], capture_output=True).returncode == 0: return
+    try: os.link(src, dst)
+    except OSError: shutil.copyfile(src, dst)
+
+
+# A game app (--game-apk): the game in an app of its own, org.nxnative.game.t<title ID> with its name and icon, entered through dm/android/java GameStart with no launcher
+# (apk/AndroidManifest.game.xml). The APK carries the game's host and its files as push_game lays them out on the phone (assets/game/, unpacked by GameStart at the first
+# start), and the RomFS image as a stored entry when the APK stays under 2 GiB (build_apk.py: a ZIP without ZIP64). A bigger game's RomFS goes beside it, <name>.romfs,
+# which the player puts anywhere on the device and picks once in the app. --xapk packs one .xapk instead (an XAPK installer's format: the APK, the RomFS as the app's OBB
+# file Android/obb/<package>/main.1.<package>.obb, icon.jpg and manifest.json), for any size; the two kinds sit side by side, each replacing only its own files. Nothing
+# goes into the library of hosts: the nxnative app stays as it was.
+# → the files made, the APK (or XAPK) first
+GAME_APP_LIMIT = (2 << 30) - (64 << 20)   # the APK's size with the RomFS inside it, kept clear of 2 GiB for the ZIP's own records
+
+
+def make_game_app(sdk, g, game, patched, spv, font, aoc, lang, so, meta, work, logs, env, out_dir, xapk):
+    sys.path.insert(0, str(REPO / 'dm/android/tools')); import build_apk
+    pkg = build_apk.game_package(g.id)
+    rom = bi.rfs.source(game)
+    if not bi.rfs.is_image(rom): raise BuildError(f'a game app reads the RomFS as one image ({game}/RomFS.img), and this extraction has a RomFS folder: extract the game again')
+    stage = work / 'game_app'; shutil.rmtree(stage, ignore_errors=True); stage.mkdir(parents=True)
+    for name, src in (('code', patched), ('spv', spv), ('font', font), ('aoc', aoc)):
+        if src and Path(src).is_dir(): (stage / name).symlink_to(Path(src).resolve(), target_is_directory=True)
+    for f in ('icon.jpg', 'control.nacp'):
+        if (game / f).is_file(): (stage / f).symlink_to((game / f).resolve())
+    (stage / 'defaults.txt').write_text(f'DM_LANG={lang}\n', encoding='utf-8')
+    (stage / 'game.json').write_text(json.dumps({**meta, 'package': pkg}, indent=1), encoding='utf-8')
+    files = sorted(Path(r, f).relative_to(stage).as_posix() for r, _, fs in os.walk(stage, followlinks=True) for f in fs)
+    (stage / 'files.txt').write_text(''.join(f + '\n' for f in files + ['files.txt']), encoding='utf-8', newline='\n')
+    rom_bytes = Path(str(rom)).stat().st_size
+    others = sum(Path(stage, f).stat().st_size for f in files)
+    inside = not xapk and others + rom_bytes < GAME_APP_LIMIT
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = safe_name(meta.get('name') or g.id) or g.id
+    apk = (work / f'{pkg}.apk') if xapk else out_dir / f'{base}.apk'
+    icon = game / 'icon.jpg'
+    bi.PROG.set(step='packing the APK' + (' with the RomFS inside' if inside else ''))
+    bi.run([sys.executable, REPO / 'dm/android/tools/build_apk.py', '--sdk', sdk, '--game-app', g.id, '--so', so, '--game-dir', stage,
+            *(['--romfs', str(rom)] if inside else []), '--keystore', KEYSTORE, '-o', apk, '--label', meta.get('name') or g.id,
+            *(['--icon', icon] if icon.is_file() else [])], logs / 'android_game_apk.log', env=env)
+    Path(f'{apk}.idsig').unlink(missing_ok=True)   # apksigner's v4 signature, for adb's incremental installs only: clutter beside an app to share
+    if xapk:
+        out = out_dir / f'{base}.xapk'; obb = f'Android/obb/{pkg}/main.1.{pkg}.obb'
+        manifest = {'xapk_version': 2, 'package_name': pkg, 'name': meta.get('name') or g.id, 'locales_name': {}, 'version_code': '1', 'version_name': '0.1',
+                    'min_sdk_version': '29', 'target_sdk_version': '34', 'permissions': ['android.permission.VIBRATE'],
+                    'total_size': apk.stat().st_size + rom_bytes, 'expansions': [{'file': obb, 'install_location': 'EXTERNAL_STORAGE', 'install_path': obb}]}
+        if icon.is_file(): manifest['icon'] = 'icon.jpg'
+        tmp = out.with_suffix('.xapk.part')
+        import zipfile
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_STORED) as z:   # stored: the APK is compressed already, and the RomFS is read where it lies
+            z.writestr('manifest.json', json.dumps(manifest, indent=1, ensure_ascii=False))
+            if icon.is_file(): z.write(icon, 'icon.jpg')
+            z.write(apk, f'{pkg}.apk')
+            with open(str(rom), 'rb') as src, z.open(zipfile.ZipInfo(obb, datetime.datetime.now().timetuple()[:6]), 'w', force_zip64=True) as dst:
+                done = 0
+                while chunk := src.read(16 << 20):
+                    dst.write(chunk); done += len(chunk); bi.PROG.set(step='packing the XAPK', done=done, total=rom_bytes, unit='B')
+        tmp.replace(out); apk.unlink(missing_ok=True); made = [out]
+    else:   # an APK and the RomFS beside it, or an APK with it inside, whichever the game's size gave: a .romfs left from the other way goes
+        made = [apk]; romfs = out_dir / f'{base}.romfs'
+        if inside: romfs.unlink(missing_ok=True)
+        else: clone(str(rom), romfs); made.append(romfs)
+    return made, inside
 
 
 def make_apk(sdk, logs, env):   # the app with every host in the library → its path
@@ -520,7 +598,14 @@ def main(argv):
     ap.add_argument('--info', action='store_true', help="print the NSP folder's game details as JSON and stop")
     ap.add_argument('--progress', choices=('auto', 'bar', 'lines', 'json', 'off'), default='auto', help='stage lines on the console; json = newline-delimited JSON events')
     ap.add_argument('--allow-damaged', action='store_true', help='pack files that fail the NCA hash check as read')
+    ap.add_argument('--game-apk', action='store_true', help='the game in an app of its own, to install on any device (no phone needed; the nxnative app is left as it is)')
+    ap.add_argument('--xapk', action='store_true', help='with --game-apk: one .xapk (the APK with the RomFS as its OBB file) for an XAPK installer')
+    ap.add_argument('--out', help='with --game-apk: the folder for the app (default: the NSP folder)')
     a = ap.parse_args(argv)
+    if a.xapk: a.game_apk = True
+    if a.game_apk:
+        if a.push_only or a.update_shaders or a.apk_only or a.migrate: raise BuildError('--game-apk builds the game; it goes with none of --push-only, --update-shaders, --apk-only, --migrate')
+        a.no_push = True   # a game app goes to no phone from here
     bi.PROG.mode = bi.progress_mode('off' if a.check or a.info else a.progress); bi.ALLOW_DAMAGED = a.allow_damaged
     if not (a.check or a.info) and os.environ.get('NXNATIVE_JOURNAL', '1') != '0': bi.PROG = Journaled(bi.PROG.mode, argv)
     if a.check or a.info:   # stdout carries the JSON alone: messages on the way (say) go to stderr
@@ -619,14 +704,26 @@ def main(argv):
         dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
         spv = build_shaders(sv, {v: (game if v == pkg_ver else bi.extract(nx, keys, ex, v, picks[v][0], picks[v][1], None, logs, g)) for v in sv}, work, logs, env, g, dlc_roms)
         bi.PROG.stage('Android host'); so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
-        library_add(g.id, so, loader, st, {'title_id': g.id, 'name': nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
+        if not a.game_apk: library_add(g.id, so, loader, st, {'title_id': g.id, 'name': nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
                                             'display': nacp.version(game / 'control.nacp'), 'nsp_dir': str(nsp_dir)})
         bi.PROG.end(str(so))
         font = button_font(work, logs, env)
     have_l = nacp.languages(game / 'control.nacp')
     lang = bi.game_language(bi.language_code(a.language) or 'en-US', a.language != 'en-US', have_l)
-    bi.PROG.stage('APK'); apk = make_apk(sdk, logs, env); bi.PROG.end(str(apk))
     label = nacp.name(game / 'control.nacp') or g.get('name', '') or g.id
+    if a.game_apk:
+        rom = bi.rfs.source(game)
+        meta = {'title_id': g.id, 'name': label, 'version': pkg_ver, 'display': nacp.version(game / 'control.nacp'),
+                'romfs_bytes': Path(rom).stat().st_size if bi.rfs.is_image(rom) else None}
+        bi.PROG.stage('game app')
+        made, inside = make_game_app(sdk, g, game, patched, spv, font, work / 'aoc', lang, so, meta, work, logs, env,
+                                     Path(a.out).expanduser().resolve() if a.out else nsp_dir, a.xapk)
+        bi.PROG.end(str(made[0]))
+        if a.xapk: say(f'done: {made[0]}. Install it with an XAPK installer on the device; it puts the game data in Android/obb. Or unzip it, install the APK and copy Android/obb/ to the device')
+        elif inside: say(f'done: {made[0]}, the game with its data inside. Install it on any Android device (arm64, Vulkan)')
+        else: say(f'done: {made[0]} and {made[1].name}. Install the APK, put {made[1].name} anywhere on the device or its SD card, and pick it when the app first opens')
+        return
+    bi.PROG.stage('APK'); apk = make_apk(sdk, logs, env); bi.PROG.end(str(apk))
     if a.no_push:
         say(f'done: {apk}. On the phone: install it, then copy {patched} to {REMOTE}/games/{g.id}/code and {bi.rfs.source(game)} to {REMOTE}/games/{g.id}/'); return
     bi.PROG.stage('install and copy to the phone')

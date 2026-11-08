@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A game app (tools/build_apk.py, its game-app mode): one game in an app of its own, package org.nxnative.game.t<title ID> with the game's name and icon, so several install
+     side by side and apart from the nxnative app. GameStart (dm/android/java) unpacks the game the APK carries, finds its RomFS (in the APK, in the app's OBB folder, or
+     a file the player picked) and starts the NativeActivity in the same process, with the game's host as its library: no launcher and no loader. build_apk.py fills in
+     @PACKAGE@ and @LIB@ -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@PACKAGE@" android:versionCode="1" android:versionName="0.1">
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true"/>
+    <uses-feature android:glEsVersion="0x00030000"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
+    <application android:label="nxnative" android:hasCode="true" android:extractNativeLibs="true"
+        android:appCategory="game" android:isGame="true" android:resizeableActivity="false">
+        <profileable android:shell="true"/>
+        <!-- the app's entry: unpacking on the first start, the game data's file picker when the RomFS isn't in the APK or its OBB folder -->
+        <activity android:name="org.nxnative.android.GameStart" android:exported="true"
+            android:screenOrientation="sensorLandscape" android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!-- the game, in GameStart's process: it reads DM_ROMFS from the environment GameStart set, and ends the process when it closes (front_android.c) -->
+        <activity android:name="android.app.NativeActivity" android:exported="false" android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape" android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density">
+            <meta-data android:name="android.app.lib_name" android:value="@LIB@"/>
+        </activity>
+    </application>
+</manifest>

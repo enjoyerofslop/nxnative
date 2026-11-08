@@ -56,6 +56,32 @@ class Images(unittest.TestCase):
         self.assertEqual(self.content('data/z'), b'')
         self.assertTrue(image.read_index(self.dst)['data/empty'][0])
 
+    def test_an_image_inside_another_file_opens_by_descriptor(self):
+        # an Android game app's image: a stored entry of its APK (or a file the player picked), handed to the host as "fd:<descriptor>:<offset>:<length>"
+        (self.src / 'data').mkdir()
+        (self.src / 'data/a').write_bytes(b'hello')
+        image.pack(self.src, self.dst)
+        _, offset, size = image.read_index(self.dst)['data/a']
+        img = self.dst.read_bytes()
+        outer = self.root / 'outer.bin'; lead = b'PK' * 2048 + b'x'   # an odd offset: nothing assumes alignment
+        outer.write_bytes(lead + img + b'trailing bytes of the zip')
+        source = self.root / 'validate_fd.c'
+        source.write_text('#include "romfs_image.h"\n#include <stdio.h>\nint main(int argc, char **argv) {\n'
+                          'if (argc != 6) return 2; int fd = open(argv[1], O_RDONLY); char spec[96], buf[16] = {0};\n'
+                          'snprintf(spec, sizeof spec, "fd:%d:%s:%s", fd, argv[2], argv[3]);\n'
+                          'if (!romfs_image_named(spec)) return 3;\n'
+                          'romfs_img *m = romfs_image_open(spec); if (!m) return 1;\n'
+                          'if (m->fd == fd || !romfs_image_read(m->fd, buf, (size_t)atoi(argv[5]), (off_t)(m->base + atoll(argv[4])))) return 4;\n'
+                          'romfs_image_close(m); if (fcntl(fd, F_GETFD) < 0) return 5;\n'
+                          'return strcmp(buf, "hello") ? 6 : 0; }\n')
+        exe = self.root / 'validate_fd'
+        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'), str(source), '-o', str(exe)], check=True)
+        run = lambda off, length: subprocess.run([str(exe), str(outer), str(off), str(length), str(offset), str(size)]).returncode
+        self.assertEqual(run(len(lead), len(img)), 0)
+        self.assertEqual(run(len(lead) + 1, len(img)), 1)   # not where the image starts
+        self.assertEqual(run(len(lead), len(img) + 1), 1)   # a length that isn't the image's
+        self.assertEqual(run(len(lead), len(img) + 10 ** 9), 1)   # past the file's end
+
     def test_reuse_rebuilds_changed_added_removed_and_renamed_files(self):
         (self.src / 'a').write_bytes(b'old')
         image.pack(self.src, self.dst, reuse=True)

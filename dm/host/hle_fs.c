@@ -207,8 +207,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
             strlcpy(g_mnt[g_nmnt].dir, work, sizeof g_mnt[0].dir); }
     } else strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
     g_mnt[g_nmnt].img = NULL;
-    struct stat ist;
-    if (ro && !txn && !stat(dir, &ist) && S_ISREG(ist.st_mode)) {   // a RomFS image file in place of a folder
+    if (ro && !txn && romfs_image_named(dir)) {   // a RomFS image file in place of a folder, or an open descriptor's part (romfs_image_spec)
         if (!(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
     }
     g_nmnt++;
@@ -450,8 +449,7 @@ static void romfs_tables(const char *dir, size_t *ndir, size_t *dbytes, size_t *
 }
 static size_t romfs_work_size(const char *dir) {
     size_t ndir = 1, dbytes = 0x18, nfile = 0, fbytes = 0;   // the root directory has an entry with an empty name
-    struct stat st;
-    if (!stat(dir, &st) && S_ISREG(st.st_mode)) {
+    if (romfs_image_named(dir)) {
         romfs_img *m = img_open(dir);
         if (!m) return 0x1000;
         for (uint64_t k = 1; k < m->n; k++) {
@@ -725,7 +723,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     size_t got = 0; int reprep = 0, fd = (int)h; int64_t base = 0;
     if (IMG_H(h)) {   // an image entry: read the image's descriptor at the entry's offset, never past its end
         const img_ent *x = &g_mnt[IMG_M(h)].img->e[IMG_K(h)];
-        fd = g_mnt[IMG_M(h)].img->fd; base = (int64_t)x->a;
+        fd = g_mnt[IMG_M(h)].img->fd; base = g_mnt[IMG_M(h)].img->base + (int64_t)x->a;
         sz = off < 0 || (uint64_t)off >= x->b ? 0 : (size_t)(x->b - off) < sz ? (size_t)(x->b - off) : sz;
     }
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first

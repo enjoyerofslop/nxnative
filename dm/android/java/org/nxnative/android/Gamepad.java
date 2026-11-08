@@ -315,9 +315,18 @@ public final class Gamepad extends View {
         shape(c, circle(menuCx(), menuCy(), K_SWAP_R * u), menuHeld); label(c, "≡", menuCx(), menuCy(), 18 * u, menuHeld);
     }
 
-    // The launcher in front (the game's process keeps running behind it): Play there resumes this game, or asks before closing it for another (Launcher.java)
+    // The launcher in front (the game's process keeps running behind it): Play there resumes this game, or asks before closing it for another (Launcher.java). A game app
+    // (apk/AndroidManifest.game.xml, java GameStart) has no launcher: the home screen comes in front instead, the game paused behind it, and the app's icon brings it back
     void toLauncher() {
         Context a = getContext(); android.content.Intent i = new android.content.Intent(a, Launcher.class);
+        boolean has;   // asked of the package manager: an explicit intent's resolveActivity names its component without looking it up
+        try { a.getPackageManager().getActivityInfo(new android.content.ComponentName(a, Launcher.class), 0); has = true; }
+        catch (android.content.pm.PackageManager.NameNotFoundException e) { has = false; }
+        if (!has) {
+            a.startActivity(new android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_HOME)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK));
+            nativeLog("gamepad: menu: a game app has no launcher; to the home screen"); return;
+        }
         i.addFlags(android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
         a.startActivity(i); nativeLog("gamepad: menu: back to the launcher");
     }
