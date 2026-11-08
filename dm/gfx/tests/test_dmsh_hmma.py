@@ -4,6 +4,7 @@ GPU the rewritten body against a CPU reference of PTX mma.m16n8k16 (f16 sources 
 of calls with TensorPass's flags (an accumulator kept in its slot between calls, A kept from the call before, C = 0, A loaded from shared memory where an LDSM read it,
 plain and transposed). With DMSH_TEST_XLATE (the translator), the flags it gives two chained HMMAs on an LDSM's matrices."""
 import ast
+import bisect
 import json
 import os
 from pathlib import Path
@@ -16,11 +17,11 @@ import tempfile
 import unittest
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
-NAMES = {'hmma_msl', 'split_params', 'block_end', 'BRACE', 'HMMA_BODY', 'HMMA_ARGS', 'HMMA_CALL', 'TG_ARRAY'}
+NAMES = {'hmma_msl', 'split_params', 'block_end', 'BRACE', 'FUNC_OPEN', 'HMMA_BODY', 'HMMA_ARGS', 'HMMA_CALL', 'TG_ARRAY'}
 tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
 selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in NAMES)
             or (isinstance(n, ast.Assign) and any(getattr(t, 'id', None) in NAMES for t in n.targets))]
-scope = {'re': re}
+scope = {'re': re, 'bisect': bisect}
 exec(compile(ast.Module(body=selected, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), scope)
 hmma_msl = scope['hmma_msl']
 
@@ -310,6 +311,13 @@ class HmmaRewrite(unittest.TestCase):
         src = HEAD + HELPER + SEQ_KERNEL   # every brace of a shader, and some other characters
         for start in [i for i, ch in enumerate(src) if ch in '{}'] + list(range(0, len(src), 97)):
             self.assertEqual(found(src, start), scan(src, start), start)
+
+    def test_function_openings_as_rfind_finds_them(self):   # hmma_msl finds a call's function among the openings found once (FUNC_OPEN, bisect): the last line holding only a brace that ends before it
+        for src in (HEAD + HELPER + SEQ_KERNEL, '\n{\n{\nx\n{\n', 'x\n{', '\n{\n'):
+            opens = [o.start() for o in scope['FUNC_OPEN'].finditer(src)]
+            for at in range(len(src) + 1):
+                k = bisect.bisect_right(opens, at - 3) - 1
+                self.assertEqual(opens[k] if k >= 0 else -1, src.rfind('\n{\n', 0, at), (src[:40], at))
 
 
 @unittest.skipUnless(shutil.which('xcrun') and shutil.which('clang'), 'needs Xcode')
